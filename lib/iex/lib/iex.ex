@@ -396,9 +396,7 @@ defmodule IEx do
     * `:width`
     * `:history_size`
     * `:default_prompt`
-    * `:continuation_prompt`
     * `:alive_prompt`
-    * `:alive_continuation_prompt`
     * `:parser`
 
   They are discussed individually in the sections below.
@@ -479,13 +477,7 @@ defmodule IEx do
 
     * `:default_prompt` - used when `Node.alive?/0` returns `false`
 
-    * `:continuation_prompt` - used when `Node.alive?/0` returns `false`
-      and more input is expected
-
     * `:alive_prompt` - used when `Node.alive?/0` returns `true`
-
-    * `:alive_continuation_prompt` - used when `Node.alive?/0` returns
-      `true` and more input is expected
 
   The following values in the prompt string will be replaced appropriately:
 

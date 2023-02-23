@@ -9,9 +9,7 @@ defmodule IEx.Config do
     :inspect,
     :history_size,
     :default_prompt,
-    :continuation_prompt,
     :alive_prompt,
-    :alive_continuation_prompt,
     :width,
     :parser
   ]
@@ -47,20 +45,12 @@ defmodule IEx.Config do
     Application.fetch_env!(:iex, :default_prompt)
   end
 
-  def continuation_prompt() do
-    Application.get_env(:iex, :continuation_prompt, default_prompt())
-  end
-
   def alive_prompt() do
     Application.fetch_env!(:iex, :alive_prompt)
   end
 
-  def alive_continuation_prompt() do
-    Application.get_env(:iex, :alive_continuation_prompt, alive_prompt())
-  end
-
   def parser() do
-    Application.get_env(:iex, :parser, {IEx.Evaluator, :parse, []})
+    Application.get_env(:iex, :parser, {IEx.Server, :parse, []})
   end
 
   def color(color) do
@@ -188,11 +178,13 @@ defmodule IEx.Config do
   defp validate_option({:inspect, new}) when is_list(new), do: :ok
   defp validate_option({:history_size, new}) when is_integer(new), do: :ok
   defp validate_option({:default_prompt, new}) when is_binary(new), do: :ok
-  defp validate_option({:continuation_prompt, new}) when is_binary(new), do: :ok
   defp validate_option({:alive_prompt, new}) when is_binary(new), do: :ok
-  defp validate_option({:alive_continuation_prompt, new}) when is_binary(new), do: :ok
   defp validate_option({:width, new}) when is_integer(new), do: :ok
   defp validate_option({:parser, tuple}) when tuple_size(tuple) == 3, do: :ok
+
+  # TODO: Warn on Elixir v1.19 if they still do not have a use
+  defp validate_option({:continuation_prompt, new}) when is_binary(new), do: :ok
+  defp validate_option({:alive_continuation_prompt, new}) when is_binary(new), do: :ok
 
   defp validate_option(option) do
     raise ArgumentError, "invalid configuration #{inspect(option)}"

@@ -11,7 +11,7 @@ defmodule IEx.Server do
   """
 
   @doc false
-  defstruct parser_state: "",
+  defstruct parser_state: [],
             counter: 1,
             prefix: "iex",
             on_eof: :stop_evaluator,
@@ -82,7 +82,7 @@ defmodule IEx.Server do
     )
 
     evaluator = start_evaluator(state.counter, Keyword.merge(state.evaluator_options, opts))
-    loop(state, :ok, evaluator, Process.monitor(evaluator), input)
+    loop(state, evaluator, Process.monitor(evaluator), input)
   end
 
   # Starts an evaluator using the provided options.
@@ -111,18 +111,19 @@ defmodule IEx.Server do
     run_without_registration(state, opts, input)
   end
 
-  defp loop(state, status, evaluator, evaluator_ref, input) do
-    :io.setopts(expand_fun: state.expand_fun)
-    input = input || io_get(prompt(status, state.prefix, state.counter))
+  defp loop(state, evaluator, evaluator_ref, input) do
+    %{counter: counter, expand_fun: expand_fun, prefix: prefix, parser_state: parser} = state
+    :io.setopts(expand_fun: expand_fun)
+    input = input || io_get(prompt(prefix, counter), counter, parser)
     wait_input(state, evaluator, evaluator_ref, input)
   end
 
   defp wait_input(state, evaluator, evaluator_ref, input) do
     receive do
-      {:io_reply, ^input, code} when is_binary(code) ->
+      {:io_reply, ^input, {:ok, code, parser_state}} ->
         :io.setopts(expand_fun: fn _ -> {:yes, [], []} end)
-        send(evaluator, {:eval, self(), code, state.counter, state.parser_state})
-        wait_eval(state, evaluator, evaluator_ref)
+        send(evaluator, {:eval, self(), code, state.counter})
+        wait_eval(%{state | parser_state: parser_state}, evaluator, evaluator_ref)
 
       {:io_reply, ^input, :eof} ->
         case state.on_eof do
@@ -130,15 +131,21 @@ defmodule IEx.Server do
           :stop_evaluator -> stop_evaluator(evaluator, evaluator_ref)
         end
 
+      {:io_reply, ^input, {:error, kind, error, stacktrace}} ->
+        banner = IEx.color(:eval_error, Exception.format_banner(kind, error, stacktrace))
+        stackdata = Exception.format_stacktrace(stacktrace)
+        IO.write(:stdio, [banner, ?\n, IEx.color(:stack_info, stackdata)])
+        loop(%{state | parser_state: []}, evaluator, evaluator_ref, nil)
+
       # Triggered by pressing "i" as the job control switch
       {:io_reply, ^input, {:error, :interrupted}} ->
         io_error("** (EXIT) interrupted")
-        loop(%{state | parser_state: ""}, :ok, evaluator, evaluator_ref, nil)
+        loop(%{state | parser_state: []}, evaluator, evaluator_ref, nil)
 
       # Unknown IO message
       {:io_reply, ^input, msg} ->
         io_error("** (EXIT) unknown IO message: #{inspect(msg)}")
-        loop(%{state | parser_state: ""}, :ok, evaluator, evaluator_ref, nil)
+        loop(%{state | parser_state: []}, evaluator, evaluator_ref, nil)
 
       # Triggered when IO dies while waiting for input
       {:DOWN, ^input, _, _, _} ->
@@ -153,10 +160,10 @@ defmodule IEx.Server do
 
   defp wait_eval(state, evaluator, evaluator_ref) do
     receive do
-      {:evaled, ^evaluator, status, parser_state} ->
+      {:evaled, ^evaluator, status} ->
         counter = if(status == :ok, do: state.counter + 1, else: state.counter)
-        state = %{state | counter: counter, parser_state: parser_state}
-        loop(state, status, evaluator, evaluator_ref, nil)
+        state = %{state | counter: counter}
+        loop(state, evaluator, evaluator_ref, nil)
 
       msg ->
         handle_take_over(msg, state, evaluator, evaluator_ref, nil, fn state ->
@@ -193,7 +200,7 @@ defmodule IEx.Server do
         if take_over?(take_pid, take_ref, state.counter + 1, true) do
           # Since we are in process, also bump the counter
           state = reset_state(bump_counter(state))
-          loop(state, :ok, evaluator, evaluator_ref, input)
+          loop(state, evaluator, evaluator_ref, input)
         else
           callback.(state)
         end
@@ -342,7 +349,7 @@ defmodule IEx.Server do
   # Once the rerunning session restarts, we keep the same evaluator_options
   # and rollback to a new evaluator.
   defp reset_state(state) do
-    %{state | parser_state: ""}
+    %{state | parser_state: []}
   end
 
   defp bump_counter(state) do
@@ -351,42 +358,127 @@ defmodule IEx.Server do
 
   ## IO
 
-  defp io_get(prompt) do
+  defp io_get(prompt, counter, parser_state) do
     gl = Process.group_leader()
     ref = Process.monitor(gl)
-    command = {:get_until, :unicode, prompt, __MODULE__, :__parse__, []}
+    command = {:get_until, :unicode, prompt, __MODULE__, :__parse__, [{counter, parser_state}]}
     send(gl, {:io_request, self(), ref, command})
     ref
   end
 
   @doc false
-  def __parse__([], :eof), do: {:done, :eof, []}
-  def __parse__([], chars), do: {:done, List.to_string(chars), []}
+  def __parse__(_, :eof, _parser_state), do: {:done, :eof, []}
 
-  defp prompt(status, prefix, counter) do
-    {mode, prefix} =
-      if Node.alive?() do
-        {prompt_mode(status, :alive), default_prefix(status, prefix)}
-      else
-        {prompt_mode(status, :default), default_prefix(status, prefix)}
+  def __parse__([], chars, {counter, parser_state} = to_be_unused) do
+    __parse__({counter, parser_state, IEx.Config.parser()}, chars, to_be_unused)
+  end
+
+  def __parse__({counter, parser_state, mfa}, chars, _unused) do
+    {parser_module, parser_fun, args} = mfa
+    args = [chars, [line: counter, file: "iex"], parser_state | args]
+
+    case apply(parser_module, parser_fun, args) do
+      {:ok, forms, parser_state} -> {:done, {:ok, forms, parser_state}, []}
+      {:incomplete, parser_state} -> {:more, {counter, parser_state, mfa}}
+    end
+  catch
+    kind, error ->
+      {:done, {:error, kind, error, __STACKTRACE__}, []}
+  end
+
+  # If parsing fails, this might be a TokenMissingError which we treat in
+  # a special way (to allow for continuation of an expression on the next
+  # line in IEx).
+  #
+  # The first two clauses provide support for the break-trigger allowing to
+  # break out from a pending incomplete expression. See
+  # https://github.com/elixir-lang/elixir/issues/1089 for discussion.
+  @break_trigger ~c"#iex:break\n"
+
+  @op_tokens [:or_op, :and_op, :comp_op, :rel_op, :arrow_op, :in_op] ++
+               [:three_op, :concat_op, :mult_op]
+
+  @doc false
+  def parse(input, opts, parser_state)
+
+  def parse(input, opts, []), do: parse(input, opts, {[], :other})
+
+  def parse(@break_trigger, opts, _parser_state) do
+    :elixir_errors.parse_error(
+      [line: opts[:line]],
+      opts[:file],
+      "incomplete expression",
+      "",
+      {~c"", Keyword.get(opts, :line, 1), Keyword.get(opts, :column, 1)}
+    )
+  end
+
+  def parse(input, opts, {buffer, last_op}) do
+    input = buffer ++ input
+    file = Keyword.get(opts, :file, "nofile")
+    line = Keyword.get(opts, :line, 1)
+    column = Keyword.get(opts, :column, 1)
+
+    result =
+      with {:ok, tokens} <- :elixir.string_to_tokens(input, line, column, file, opts),
+           {:ok, adjusted_tokens} <- adjust_operator(tokens, line, column, file, opts, last_op),
+           {:ok, forms} <- :elixir.tokens_to_quoted(adjusted_tokens, file, opts) do
+        last_op =
+          case forms do
+            {:=, _, [_, _]} -> :match
+            _ -> :other
+          end
+
+        {:ok, forms, last_op}
       end
 
+    case result do
+      {:ok, forms, last_op} ->
+        {:ok, forms, {[], last_op}}
+
+      {:error, {_, _, ""}} ->
+        {:incomplete, {input, last_op}}
+
+      {:error, {location, error, token}} ->
+        :elixir_errors.parse_error(
+          location,
+          file,
+          error,
+          token,
+          {input, line, column}
+        )
+    end
+  end
+
+  defp adjust_operator([{op_type, _, token} | _] = _tokens, line, column, _file, _opts, :match)
+       when op_type in @op_tokens,
+       do:
+         {:error,
+          {[line: line, column: column],
+           "pipe shorthand is not allowed immediately after a match expression in IEx. To make it work, surround the whole pipeline with parentheses ",
+           "'#{token}'"}}
+
+  defp adjust_operator([{op_type, _, _} | _] = tokens, line, column, file, opts, _last_op)
+       when op_type in @op_tokens do
+    {:ok, prefix} = :elixir.string_to_tokens(~c"v(-1)", line, column, file, opts)
+    {:ok, prefix ++ tokens}
+  end
+
+  defp adjust_operator(tokens, _line, _column, _file, _opts, _last_op), do: {:ok, tokens}
+
+  defp prompt(prefix, counter) do
     prompt =
-      apply(IEx.Config, mode, [])
+      if Node.alive?() do
+        IEx.Config.alive_prompt()
+      else
+        IEx.Config.default_prompt()
+      end
       |> String.replace("%counter", to_string(counter))
       |> String.replace("%prefix", to_string(prefix))
       |> String.replace("%node", to_string(node()))
 
     [prompt, " "]
   end
-
-  defp default_prefix(:incomplete, _prefix), do: "..."
-  defp default_prefix(_ok_or_error, prefix), do: prefix
-
-  defp prompt_mode(:incomplete, :default), do: :continuation_prompt
-  defp prompt_mode(:incomplete, :alive), do: :alive_continuation_prompt
-  defp prompt_mode(_ok_or_error, :default), do: :default_prompt
-  defp prompt_mode(_ok_or_error, :alive), do: :alive_prompt
 
   defp io_error(result) do
     IO.puts(:stdio, IEx.color(:eval_error, result))
