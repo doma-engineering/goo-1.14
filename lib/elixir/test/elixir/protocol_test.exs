@@ -159,6 +159,15 @@ defmodule ProtocolTest do
     assert args == [{:type, 23, :product, [{:user_type, 23, :t, []}]}, {:type, 23, :term, []}]
   end
 
+  # Author: Quinn Wilton @ http://quinnwilton.com/
+  test "protocol with no functions is a behaviour" do
+    defprotocol ProtoNoFunctions do
+    end
+
+    defimpl ProtoNoFunctions, for: Integer do
+    end
+  end
+
   test "protocol defines functions and attributes" do
     assert Sample.__protocol__(:module) == Sample
     assert Sample.__protocol__(:functions) == [ok: 1]
@@ -278,13 +287,6 @@ defmodule ProtocolTest do
 
   describe "warnings" do
     import ExUnit.CaptureIO
-
-    test "with no definitions" do
-      assert capture_io(:stderr, fn ->
-               defprotocol SampleWithNoDefinitions do
-               end
-             end) =~ "protocols must define at least one function, but none was defined"
-    end
 
     test "when @callbacks and friends are defined inside a protocol" do
       message =
